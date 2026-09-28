@@ -1,0 +1,13 @@
+{
+  "name": "dataflow-crm",
+  "version": "1.0.0",
+  "description": "DataFlow CRM - React, Node.js, Express & MongoDB with Excel Import/Filter/Export",
+  "scripts": {
+    "server": "npm run start --prefix server",
+    "server:dev": "npm run dev --prefix server",
+    "client": "npm run dev --prefix client",
+    "install:all": "npm install --prefix server && npm install --prefix client",
+    "build:client": "npm run build --prefix client"
+  },
+  "keywords": ["crm", "react", "nodejs", "mongodb", "excel", "xlsx"]
+}
