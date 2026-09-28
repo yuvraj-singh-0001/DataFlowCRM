@@ -1,4 +1,13 @@
 require('dotenv').config();
+const dns = require('dns');
+
+// Fix for Windows Node.js querySrv ECONNREFUSED with MongoDB Atlas
+try {
+  dns.setServers(['8.8.8.8', '8.8.4.4']);
+} catch (e) {
+  console.warn('DNS server override notice:', e.message);
+}
+
 const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
