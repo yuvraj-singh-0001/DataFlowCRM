@@ -15,7 +15,8 @@ import {
   RefreshCw,
   Sparkles,
   SearchCheck,
-  Layers
+  PhoneCall,
+  UserCheck
 } from 'lucide-react';
 import * as XLSX from 'xlsx';
 import { 
@@ -36,7 +37,11 @@ export default function ExcelCleaner({ notify, onRefreshDb }) {
   const [processedData, setProcessedData] = useState([]);
   const [filterMode, setFilterMode] = useState('valid'); // 'all' | 'valid' | 'invalid' | 'duplicates'
   const [removeDuplicates, setRemoveDuplicates] = useState(true);
-  const [captureMultipleNumbers, setCaptureMultipleNumbers] = useState(true);
+
+  // Number selection mode: 'single' (1 number per row) or 'all' (capture both mother & father)
+  // Default is 'single' as requested: exactly 1 phone number per row!
+  const [numberMode, setNumberMode] = useState('single'); 
+
   const [isProcessing, setIsProcessing] = useState(false);
   const [isSavingDb, setIsSavingDb] = useState(false);
   const [saveProgress, setSaveProgress] = useState(0);
@@ -49,7 +54,7 @@ export default function ExcelCleaner({ notify, onRefreshDb }) {
     nameCol = selectedNameCol, 
     phoneCol = selectedPhoneCol, 
     deduplicate = removeDuplicates,
-    includeAllNumbers = captureMultipleNumbers
+    mode = numberMode
   ) => {
     if (!rows || rows.length === 0) {
       setProcessedData([]);
@@ -61,20 +66,19 @@ export default function ExcelCleaner({ notify, onRefreshDb }) {
     let recordCounter = 1;
 
     rows.forEach((row, rowIndex) => {
-      // 1. If captureMultipleNumbers is enabled, collect all unique numbers in the entire row
+      // 1. Collect all unique phone numbers in this row
       const rowPhoneCandidates = [];
 
-      // Check all cells in the row for phone numbers
       for (const [key, val] of Object.entries(row)) {
         const phonesInCell = extractPhonesFromValue(val);
         phonesInCell.forEach((p) => {
-          if (!rowPhoneCandidates.includes(p)) {
+          if (!rowPhoneCandidates.some((c) => c.phone === p)) {
             rowPhoneCandidates.push({ phone: p, fromKey: key, rawVal: String(val) });
           }
         });
       }
 
-      // If specific column was picked and has a valid phone, prioritize it first
+      // If a specific target phone column is selected, prioritize it
       if (phoneCol !== 'AUTO' && row[phoneCol] !== undefined) {
         const preferredPhones = extractPhonesFromValue(row[phoneCol]);
         if (preferredPhones.length > 0) {
@@ -86,30 +90,30 @@ export default function ExcelCleaner({ notify, onRefreshDb }) {
         }
       }
 
-      // 2. Determine Name for this row
+      // 2. Determine Clean Pure Name for this row (NO extra brackets or Alt suffixes)
       const contact = scanRowForContact(
         row, 
         nameCol === 'AUTO' ? '' : nameCol, 
         phoneCol === 'AUTO' ? '' : phoneCol
       );
+      const cleanPureName = contact.name || 'Customer';
 
-      // If row has valid phone numbers found anywhere
+      // 3. Emit records based on numberMode:
+      // If 'single' -> take ONLY the 1st primary number (1 row per contact)
+      // If 'all' -> take all numbers found in row
       if (rowPhoneCandidates.length > 0) {
-        // If user wants to capture all numbers found in row
-        const phonesToEmit = includeAllNumbers ? rowPhoneCandidates : [rowPhoneCandidates[0]];
+        const phonesToEmit = mode === 'all' ? rowPhoneCandidates : [rowPhoneCandidates[0]];
 
-        phonesToEmit.forEach((phoneObj, subIdx) => {
+        phonesToEmit.forEach((phoneObj) => {
           const isDuplicate = seenPhones.has(phoneObj.phone);
           if (!isDuplicate) {
             seenPhones.add(phoneObj.phone);
           }
 
-          const suffix = phonesToEmit.length > 1 && subIdx > 0 ? ` (Alt ${subIdx})` : '';
-
           result.push({
             id: recordCounter++,
             rowNumber: rowIndex + 2,
-            name: `${contact.name}${suffix}`,
+            name: cleanPureName, // Strictly clean name, NO (Alt 1) or extra suffixes
             phone: phoneObj.phone,
             originalName: contact.originalName || row[nameCol] || '',
             originalPhone: phoneObj.rawVal,
@@ -120,14 +124,14 @@ export default function ExcelCleaner({ notify, onRefreshDb }) {
           });
         });
       } else {
-        // No valid phone found in any cell of this row
+        // No valid 10-digit number found anywhere in this row
         result.push({
           id: recordCounter++,
           rowNumber: rowIndex + 2,
-          name: contact.name,
+          name: cleanPureName,
           phone: '',
           originalName: contact.originalName || '',
-          originalPhone: contact.originalPhone || '(No number in row)',
+          originalPhone: '(No phone in row)',
           foundInColumn: 'None',
           isValid: false,
           isDuplicate: false,
@@ -171,16 +175,16 @@ export default function ExcelCleaner({ notify, onRefreshDb }) {
         setSelectedNameCol(detected.nameCol || 'AUTO');
         setSelectedPhoneCol(detected.phoneCol || 'AUTO');
 
-        // Run deep row-level extraction
+        // Process data with current mode (Default: 'single' -> 1 number per row)
         processRows(
           json, 
           detected.nameCol || 'AUTO', 
           detected.phoneCol || 'AUTO', 
           removeDuplicates, 
-          captureMultipleNumbers
+          numberMode
         );
 
-        notify(`Scanned ${json.length} rows across all columns! Ready to export.`, 'success');
+        notify(`Scanned ${json.length} rows! 1 Number per row active.`, 'success');
       } catch (err) {
         console.error('Error reading Excel:', err);
         notify(`Failed to read file: ${err.message}`, 'error');
@@ -191,27 +195,31 @@ export default function ExcelCleaner({ notify, onRefreshDb }) {
     reader.readAsArrayBuffer(file);
   };
 
-  // Re-process when column selection changes
+  // Re-process when options change
   const handleNameColChange = (newCol) => {
     setSelectedNameCol(newCol);
-    processRows(rawRows, newCol, selectedPhoneCol, removeDuplicates, captureMultipleNumbers);
+    processRows(rawRows, newCol, selectedPhoneCol, removeDuplicates, numberMode);
   };
 
   const handlePhoneColChange = (newCol) => {
     setSelectedPhoneCol(newCol);
-    processRows(rawRows, selectedNameCol, newCol, removeDuplicates, captureMultipleNumbers);
+    processRows(rawRows, selectedNameCol, newCol, removeDuplicates, numberMode);
   };
 
   const handleDeduplicateToggle = () => {
     const newVal = !removeDuplicates;
     setRemoveDuplicates(newVal);
-    processRows(rawRows, selectedNameCol, selectedPhoneCol, newVal, captureMultipleNumbers);
+    processRows(rawRows, selectedNameCol, selectedPhoneCol, newVal, numberMode);
   };
 
-  const handleCaptureMultipleToggle = () => {
-    const newVal = !captureMultipleNumbers;
-    setCaptureMultipleNumbers(newVal);
-    processRows(rawRows, selectedNameCol, selectedPhoneCol, removeDuplicates, newVal);
+  const handleNumberModeChange = (newMode) => {
+    setNumberMode(newMode);
+    processRows(rawRows, selectedNameCol, selectedPhoneCol, removeDuplicates, newMode);
+    if (newMode === 'single') {
+      notify('Single Number Mode: Exactly 1 phone number per row will be exported.', 'info');
+    } else {
+      notify('Multi-Number Mode: All numbers in the row (Mother, Father, etc.) will be exported.', 'info');
+    }
   };
 
   // Stats calculation
@@ -244,8 +252,8 @@ export default function ExcelCleaner({ notify, onRefreshDb }) {
 
     // Format strictly as Name and Phone No (10 digits)
     const exportData = validNumbersList.map((item) => ({
-      Name: item.name,
-      'Phone No': item.phone, // Exactly 10 digits
+      Name: item.name,        // Pure Clean Name (No suffixes)
+      'Phone No': item.phone, // Strictly 10 digits
     }));
 
     const worksheet = XLSX.utils.json_to_sheet(exportData);
@@ -262,10 +270,10 @@ export default function ExcelCleaner({ notify, onRefreshDb }) {
     const finalFileName = `${cleanBaseName || 'DataFlow'}_10Digit_Filtered.xlsx`;
 
     XLSX.writeFile(workbook, finalFileName);
-    notify(`Downloaded ${exportData.length} cleaned leads into "${finalFileName}"!`, 'success');
+    notify(`Downloaded ${exportData.length} clean leads with strictly Name & Phone No!`, 'success');
   };
 
-  // Save cleaned records into MongoDB database
+  // Save cleaned records into MongoDB Atlas database
   const handleSaveToMongoDB = async () => {
     if (validNumbersList.length === 0) {
       notify('No valid records to save into MongoDB', 'error');
@@ -296,7 +304,7 @@ export default function ExcelCleaner({ notify, onRefreshDb }) {
         setSaveProgress(Math.round((inserted / total) * 100));
       }
 
-      notify(`Saved ${inserted} cleaned leads directly into MongoDB Atlas!`, 'success');
+      notify(`Saved ${inserted} cleaned leads directly into MongoDB Atlas database!`, 'success');
       if (onRefreshDb) onRefreshDb();
     } catch (err) {
       console.error('Save to MongoDB error:', err);
@@ -307,50 +315,31 @@ export default function ExcelCleaner({ notify, onRefreshDb }) {
     }
   };
 
-  // Generate Sample Messy Excel with Shuffled Columns and Different Header Names
+  // Generate Sample Messy Excel with Shuffled Columns and clean names
   const handleGenerateSampleExcel = () => {
     const sampleMessyData = [
-      // Row 1: Name in 1st col, Mobile in 3rd col with +91
-      { 'Name CUTOURE': 'Aarav Sharma', City: 'Mumbai', 'Mobile Number': '+91 98765 43210', Notes: 'VIP Client' },
-      
-      // Row 2: Phone in 1st col, Name in 4th col with 0 prefix
-      { 'Field A': '09812345678', City: 'Bengaluru', Age: 31, 'Contact Person': 'Priya Patel' },
-      
-      // Row 3: Name in 2nd col, Phone in 5th col with 91 prefix
+      { 'Name CUTOURE': 'Aarav Sharma', City: 'Mumbai', 'Mother Contact': '+91 98765 43210', 'Father Contact': '9812345678' },
+      { 'Field A': '09811223344', City: 'Bengaluru', Age: 31, 'Contact Person': 'Priya Patel' },
       { Code: 'C103', 'Customer Name': 'Rahul Verma', Status: 'Active', City: 'Delhi', 'Phone No': '919822334455' },
-      
-      // Row 4: Multiple numbers in single cell (9876543210 / 9811223344)
-      { 'Client Name': 'Sneha Rao', 'Primary & Alt Mobile': '9876543210 / 9811223344', City: 'Hyderabad' },
-      
-      // Row 5: Name and Phone in the middle with dashes
+      { 'Client Name': 'Sneha Rao', 'Primary Mobile': '98765-43210', City: 'Hyderabad' },
       { ID: 105, Dept: 'Sales', 'Full Name': 'Vikram Mehta', 'Contact': '+91-9988776655', City: 'Pune' },
-      
-      // Row 6: Duplicate phone check
-      { 'Name CUTOURE': 'Aarav Sharma (Duplicate Check)', City: 'Mumbai', 'Mobile Number': '9876543210' },
-      
-      // Row 7: Clean 10-digit number
+      { 'Name CUTOURE': 'Aarav Sharma', City: 'Mumbai', 'Mother Contact': '9876543210' }, // Duplicate check
       { 'Buyer': 'Ananya Deshmukh', City: 'Nagpur', 'Mobile': '9765432190' },
-      
-      // Row 8: Invalid number (<10 digits)
-      { 'Contact': 'Short Number User', 'Phone': '987654' },
-      
-      // Row 9: Scientific notation / Excel float number
+      { 'Contact': 'Short Number User', 'Phone': '987654' }, // Invalid (<10 digits)
       { 'Customer': 'Karan Singhania', 'Contact No': 9833411223 },
-      
-      // Row 10: Blank number
-      { 'Customer': 'No Number User', 'Contact No': '' },
+      { 'Customer': 'Blank Number User', 'Contact No': '' },
     ];
 
     const worksheet = XLSX.utils.json_to_sheet(sampleMessyData);
     const workbook = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(workbook, worksheet, 'Messy Shuffled Columns');
+    XLSX.utils.book_append_sheet(workbook, worksheet, 'Messy Sample');
     XLSX.writeFile(workbook, 'Sample_Messy_Shuffled_Excel.xlsx');
-    notify('Downloaded Sample Excel with shuffled columns, +91, 0, and multi-numbers!', 'info');
+    notify('Downloaded Sample Excel with Mother & Father contact columns for testing!', 'info');
   };
 
   return (
     <div className="cleaner-container">
-      {/* Top Banner / Explainer */}
+      {/* Top Header Card */}
       <div className="page-header-card">
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '1rem' }}>
           <div>
@@ -359,7 +348,7 @@ export default function ExcelCleaner({ notify, onRefreshDb }) {
               <span>Smart Excel Filter & 10-Digit Phone Cleaner</span>
             </h1>
             <p className="page-description">
-              Upload any messy Excel sheet. Name and Phone can be at the <strong>beginning</strong>, in the <strong>middle</strong>, or <strong>end</strong> of the row. It auto-scans every cell, strips <code>+91</code>, <code>91</code>, <code>0</code>, and exports strictly <strong>Name</strong> and <strong>10-digit Phone No</strong>!
+              Upload any messy Excel sheet. Output Excel me hamesha strictly <strong>Name</strong> aur <strong>Phone No</strong> (10 digits) aayega.
             </p>
           </div>
 
@@ -367,15 +356,15 @@ export default function ExcelCleaner({ notify, onRefreshDb }) {
             type="button" 
             className="btn btn-secondary btn-sm"
             onClick={handleGenerateSampleExcel}
-            title="Download test Excel with shuffled columns (+91, 0, 91, and multi-numbers)"
+            title="Download test Excel with Mother and Father contacts"
           >
             <Download size={14} />
-            <span>Download Test Excel (Shuffled Columns)</span>
+            <span>Download Sample Excel</span>
           </button>
         </div>
       </div>
 
-      {/* Upload Zone */}
+      {/* Upload Dropzone */}
       <div className="card upload-card">
         <div 
           className="dropzone-light"
@@ -401,17 +390,83 @@ export default function ExcelCleaner({ notify, onRefreshDb }) {
           </div>
         </div>
 
-        {/* Column Mapping Controls (when file loaded) */}
+        {/* PROMINENT Number Mode Selection (1 Number vs All Numbers) */}
         {availableColumns.length > 0 && (
-          <div className="mapping-bar">
+          <div style={{ background: '#f8fafc', border: '1px solid var(--border)', borderRadius: 'var(--radius-md)', padding: '1rem', display: 'flex', flexDirection: 'column', gap: '0.85rem' }}>
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '0.5rem' }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontWeight: 700, fontSize: '0.88rem', color: 'var(--text-main)' }}>
-                <SearchCheck size={18} style={{ color: '#4f46e5' }} />
-                <span>Deep Row Scanner Active (Auto-finds Name & Phone anywhere in each row)</span>
+              <div style={{ fontSize: '0.86rem', fontWeight: 700, color: 'var(--text-main)', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                <PhoneCall size={16} style={{ color: '#4f46e5' }} />
+                <span>Agar Ek Row Me 2 Number Ho (Jaise Mother & Father Contact) Toh Kya Karein?</span>
               </div>
             </div>
 
-            <div className="mapping-selectors">
+            {/* Clear Radio Buttons */}
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', gap: '0.75rem' }}>
+              <div 
+                onClick={() => handleNumberModeChange('single')}
+                style={{
+                  padding: '0.75rem 1rem',
+                  borderRadius: 'var(--radius-md)',
+                  border: `2px solid ${numberMode === 'single' ? '#4f46e5' : 'var(--border)'}`,
+                  background: numberMode === 'single' ? '#eef2ff' : '#ffffff',
+                  cursor: 'pointer',
+                  display: 'flex',
+                  alignItems: 'flex-start',
+                  gap: '0.65rem',
+                  transition: 'all 0.15s ease'
+                }}
+              >
+                <input
+                  type="radio"
+                  name="numberMode"
+                  checked={numberMode === 'single'}
+                  onChange={() => handleNumberModeChange('single')}
+                  style={{ marginTop: '0.2rem', cursor: 'pointer', transform: 'scale(1.15)' }}
+                />
+                <div>
+                  <div style={{ fontWeight: 700, fontSize: '0.86rem', color: numberMode === 'single' ? '#4f46e5' : 'var(--text-main)' }}>
+                    ✅ 1 Number Per Row (Recommended)
+                  </div>
+                  <div style={{ fontSize: '0.76rem', color: 'var(--text-secondary)', marginTop: '0.15rem' }}>
+                    Ek person ka sirf 1 primary number aayega. Row kabhi duplicate nahi hogi.
+                  </div>
+                </div>
+              </div>
+
+              <div 
+                onClick={() => handleNumberModeChange('all')}
+                style={{
+                  padding: '0.75rem 1rem',
+                  borderRadius: 'var(--radius-md)',
+                  border: `2px solid ${numberMode === 'all' ? '#4f46e5' : 'var(--border)'}`,
+                  background: numberMode === 'all' ? '#eef2ff' : '#ffffff',
+                  cursor: 'pointer',
+                  display: 'flex',
+                  alignItems: 'flex-start',
+                  gap: '0.65rem',
+                  transition: 'all 0.15s ease'
+                }}
+              >
+                <input
+                  type="radio"
+                  name="numberMode"
+                  checked={numberMode === 'all'}
+                  onChange={() => handleNumberModeChange('all')}
+                  style={{ marginTop: '0.2rem', cursor: 'pointer', transform: 'scale(1.15)' }}
+                />
+                <div>
+                  <div style={{ fontWeight: 700, fontSize: '0.86rem', color: numberMode === 'all' ? '#4f46e5' : 'var(--text-main)' }}>
+                    📋 Extract Both Numbers
+                  </div>
+                  <div style={{ fontSize: '0.76rem', color: 'var(--text-secondary)', marginTop: '0.15rem' }}>
+                    Agar Mother aur Father dono ka number alag hai, toh dono capture honge.
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {/* Column Target Selectors */}
+            <div className="mapping-selectors" style={{ borderTop: '1px solid var(--border)', paddingTop: '0.75rem' }}>
               <div className="selector-group">
                 <label className="selector-label">Target Name Column:</label>
                 <select
@@ -419,11 +474,9 @@ export default function ExcelCleaner({ notify, onRefreshDb }) {
                   value={selectedNameCol}
                   onChange={(e) => handleNameColChange(e.target.value)}
                 >
-                  <option value="AUTO">⚡ Auto-Detect in Row (Recommended)</option>
+                  <option value="AUTO">⚡ Auto-Detect in Row</option>
                   {availableColumns.map((col) => (
-                    <option key={col} value={col}>
-                      {col}
-                    </option>
+                    <option key={col} value={col}>{col}</option>
                   ))}
                 </select>
               </div>
@@ -435,16 +488,14 @@ export default function ExcelCleaner({ notify, onRefreshDb }) {
                   value={selectedPhoneCol}
                   onChange={(e) => handlePhoneColChange(e.target.value)}
                 >
-                  <option value="AUTO">⚡ Auto-Detect in Row (Recommended)</option>
+                  <option value="AUTO">⚡ Auto-Detect in Row</option>
                   {availableColumns.map((col) => (
-                    <option key={col} value={col}>
-                      {col}
-                    </option>
+                    <option key={col} value={col}>{col}</option>
                   ))}
                 </select>
               </div>
 
-              <div style={{ display: 'flex', alignItems: 'center', gap: '1rem', marginLeft: 'auto', flexWrap: 'wrap' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginLeft: 'auto' }}>
                 <label style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.82rem', fontWeight: 600, color: 'var(--text-secondary)', cursor: 'pointer' }}>
                   <input
                     type="checkbox"
@@ -454,23 +505,13 @@ export default function ExcelCleaner({ notify, onRefreshDb }) {
                   />
                   <span>Remove Duplicates</span>
                 </label>
-
-                <label style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.82rem', fontWeight: 600, color: 'var(--text-secondary)', cursor: 'pointer' }}>
-                  <input
-                    type="checkbox"
-                    checked={captureMultipleNumbers}
-                    onChange={handleCaptureMultipleToggle}
-                    style={{ cursor: 'pointer', transform: 'scale(1.1)' }}
-                  />
-                  <span>Capture All Numbers in Row</span>
-                </label>
               </div>
             </div>
           </div>
         )}
       </div>
 
-      {/* KPI / Metric Counters */}
+      {/* KPI Counters */}
       {processedData.length > 0 && (
         <div className="metrics-row">
           <div 
@@ -507,7 +548,7 @@ export default function ExcelCleaner({ notify, onRefreshDb }) {
         </div>
       )}
 
-      {/* Main Results Table & Actions */}
+      {/* Preview Table & Download Actions */}
       {processedData.length > 0 && (
         <div className="card table-card-light">
           <div className="table-top-actions">
@@ -516,7 +557,7 @@ export default function ExcelCleaner({ notify, onRefreshDb }) {
                 Cleaned Data Preview ({displayRows.length} {filterMode} records showing)
               </h3>
               <p style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>
-                Output format: Strictly 2 columns <code>Name</code> and <code>Phone No</code> (10 digits)
+                Output Excel Format: Strictly 2 columns <code>Name</code> and <code>Phone No</code> (clean pure name, no extra suffixes)
               </p>
             </div>
 
@@ -529,7 +570,7 @@ export default function ExcelCleaner({ notify, onRefreshDb }) {
                 title="Download 2-column filtered Excel (Name, Phone No)"
               >
                 <Download size={16} />
-                <span>Download Filtered Excel ({validCount} Clean Leads)</span>
+                <span>Download Filtered Excel ({validCount} Leads)</span>
               </button>
 
               <button
@@ -605,7 +646,7 @@ export default function ExcelCleaner({ notify, onRefreshDb }) {
 
           {displayRows.length > 100 && (
             <div style={{ padding: '0.75rem 1.25rem', background: '#f8fafc', borderTop: '1px solid var(--border)', fontSize: '0.8rem', color: 'var(--text-secondary)', textAlign: 'center' }}>
-              Showing first 100 preview rows. When you click <strong>Download Filtered Excel</strong>, all <strong>{validCount}</strong> records will be exported into your Excel sheet!
+              Showing first 100 preview rows. When you click <strong>Download Filtered Excel</strong>, all <strong>{validCount}</strong> records will be exported!
             </div>
           )}
         </div>
