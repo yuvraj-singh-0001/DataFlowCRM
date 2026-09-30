@@ -16,7 +16,9 @@ import {
   Sparkles,
   SearchCheck,
   PhoneCall,
-  UserCheck
+  UserCheck,
+  CopyCheck,
+  Info
 } from 'lucide-react';
 import * as XLSX from 'xlsx';
 import { 
@@ -39,8 +41,10 @@ export default function ExcelCleaner({ notify, onRefreshDb }) {
   const [removeDuplicates, setRemoveDuplicates] = useState(true);
 
   // Number selection mode: 'single' (1 number per row) or 'all' (capture both mother & father)
-  // Default is 'single' as requested: exactly 1 phone number per row!
-  const [numberMode, setNumberMode] = useState('single'); 
+  const [numberMode, setNumberMode] = useState('single');
+
+  // Duplicate Check Basis: 'phone' (standard) | 'both' (name + phone) | 'name'
+  const [duplicateBasis, setDuplicateBasis] = useState('phone');
 
   const [isProcessing, setIsProcessing] = useState(false);
   const [isSavingDb, setIsSavingDb] = useState(false);
@@ -48,24 +52,28 @@ export default function ExcelCleaner({ notify, onRefreshDb }) {
 
   const fileInputRef = useRef(null);
 
-  // Process rows using deep row scanner
+  // Process rows using deep row scanner and exact row-matching duplicate tracker
   const processRows = (
     rows, 
     nameCol = selectedNameCol, 
     phoneCol = selectedPhoneCol, 
     deduplicate = removeDuplicates,
-    mode = numberMode
+    mode = numberMode,
+    basis = duplicateBasis
   ) => {
     if (!rows || rows.length === 0) {
       setProcessedData([]);
       return;
     }
 
-    const seenPhones = new Set();
+    // Map key -> { firstRowNumber, firstName, firstPhone, count, duplicateRows: [] }
+    const trackerMap = new Map();
     const result = [];
     let recordCounter = 1;
 
     rows.forEach((row, rowIndex) => {
+      const currentExcelRowNumber = rowIndex + 2; // 1-based row in Excel (Row 1 is header)
+
       // 1. Collect all unique phone numbers in this row
       const rowPhoneCandidates = [];
 
@@ -98,36 +106,70 @@ export default function ExcelCleaner({ notify, onRefreshDb }) {
       );
       const cleanPureName = contact.name || 'Customer';
 
-      // 3. Emit records based on numberMode:
-      // If 'single' -> take ONLY the 1st primary number (1 row per contact)
-      // If 'all' -> take all numbers found in row
+      // 3. Emit records based on numberMode
       if (rowPhoneCandidates.length > 0) {
         const phonesToEmit = mode === 'all' ? rowPhoneCandidates : [rowPhoneCandidates[0]];
 
         phonesToEmit.forEach((phoneObj) => {
-          const isDuplicate = seenPhones.has(phoneObj.phone);
-          if (!isDuplicate) {
-            seenPhones.add(phoneObj.phone);
+          // Generate unique key based on selected duplicate basis
+          let trackKey = '';
+          let basisDescription = '';
+
+          if (basis === 'both') {
+            trackKey = `${cleanPureName.toLowerCase()}_${phoneObj.phone}`;
+            basisDescription = `Same Name ("${cleanPureName}") & Phone (${phoneObj.phone})`;
+          } else if (basis === 'name') {
+            trackKey = cleanPureName.toLowerCase();
+            basisDescription = `Same Name ("${cleanPureName}")`;
+          } else {
+            // Default: 'phone'
+            trackKey = phoneObj.phone;
+            basisDescription = `Same Phone Number (${phoneObj.phone})`;
+          }
+
+          let isDuplicate = false;
+          let duplicateOfRow = null;
+          let duplicateOfName = '';
+
+          if (trackerMap.has(trackKey)) {
+            isDuplicate = true;
+            const originalEntry = trackerMap.get(trackKey);
+            duplicateOfRow = originalEntry.firstRowNumber;
+            duplicateOfName = originalEntry.firstName;
+            originalEntry.duplicateRows.push(currentExcelRowNumber);
+          } else {
+            trackerMap.set(trackKey, {
+              firstRowNumber: currentExcelRowNumber,
+              firstName: cleanPureName,
+              firstPhone: phoneObj.phone,
+              duplicateRows: [],
+            });
           }
 
           result.push({
             id: recordCounter++,
-            rowNumber: rowIndex + 2,
-            name: cleanPureName, // Strictly clean name, NO (Alt 1) or extra suffixes
+            rowNumber: currentExcelRowNumber,
+            name: cleanPureName,
             phone: phoneObj.phone,
             originalName: contact.originalName || row[nameCol] || '',
             originalPhone: phoneObj.rawVal,
             foundInColumn: phoneObj.fromKey,
             isValid: true,
             isDuplicate,
-            reason: 'Valid 10-digit number',
+            duplicateOfRow,
+            duplicateOfName,
+            basisDescription,
+            trackKey,
+            reason: isDuplicate 
+              ? `Duplicate of Row #${duplicateOfRow}` 
+              : 'Valid 10-digit number',
           });
         });
       } else {
         // No valid 10-digit number found anywhere in this row
         result.push({
           id: recordCounter++,
-          rowNumber: rowIndex + 2,
+          rowNumber: currentExcelRowNumber,
           name: cleanPureName,
           phone: '',
           originalName: contact.originalName || '',
@@ -135,8 +177,18 @@ export default function ExcelCleaner({ notify, onRefreshDb }) {
           foundInColumn: 'None',
           isValid: false,
           isDuplicate: false,
+          duplicateOfRow: null,
+          duplicateOfName: '',
+          basisDescription: '',
           reason: 'No 10-digit phone found anywhere in row',
         });
+      }
+    });
+
+    // Back-fill the first occurrence items with the row numbers that duplicated them
+    result.forEach((item) => {
+      if (!item.isDuplicate && item.trackKey && trackerMap.has(item.trackKey)) {
+        item.repeatedInRows = trackerMap.get(item.trackKey).duplicateRows;
       }
     });
 
@@ -175,16 +227,16 @@ export default function ExcelCleaner({ notify, onRefreshDb }) {
         setSelectedNameCol(detected.nameCol || 'AUTO');
         setSelectedPhoneCol(detected.phoneCol || 'AUTO');
 
-        // Process data with current mode (Default: 'single' -> 1 number per row)
         processRows(
           json, 
           detected.nameCol || 'AUTO', 
           detected.phoneCol || 'AUTO', 
           removeDuplicates, 
-          numberMode
+          numberMode,
+          duplicateBasis
         );
 
-        notify(`Scanned ${json.length} rows! 1 Number per row active.`, 'success');
+        notify(`Scanned ${json.length} rows! Duplicate row-tracking active.`, 'success');
       } catch (err) {
         console.error('Error reading Excel:', err);
         notify(`Failed to read file: ${err.message}`, 'error');
@@ -198,28 +250,39 @@ export default function ExcelCleaner({ notify, onRefreshDb }) {
   // Re-process when options change
   const handleNameColChange = (newCol) => {
     setSelectedNameCol(newCol);
-    processRows(rawRows, newCol, selectedPhoneCol, removeDuplicates, numberMode);
+    processRows(rawRows, newCol, selectedPhoneCol, removeDuplicates, numberMode, duplicateBasis);
   };
 
   const handlePhoneColChange = (newCol) => {
     setSelectedPhoneCol(newCol);
-    processRows(rawRows, selectedNameCol, newCol, removeDuplicates, numberMode);
+    processRows(rawRows, selectedNameCol, newCol, removeDuplicates, numberMode, duplicateBasis);
   };
 
   const handleDeduplicateToggle = () => {
     const newVal = !removeDuplicates;
     setRemoveDuplicates(newVal);
-    processRows(rawRows, selectedNameCol, selectedPhoneCol, newVal, numberMode);
+    processRows(rawRows, selectedNameCol, selectedPhoneCol, newVal, numberMode, duplicateBasis);
   };
 
   const handleNumberModeChange = (newMode) => {
     setNumberMode(newMode);
-    processRows(rawRows, selectedNameCol, selectedPhoneCol, removeDuplicates, newMode);
+    processRows(rawRows, selectedNameCol, selectedPhoneCol, removeDuplicates, newMode, duplicateBasis);
     if (newMode === 'single') {
-      notify('Single Number Mode: Exactly 1 phone number per row will be exported.', 'info');
+      notify('Single Number Mode: Exactly 1 phone number per row.', 'info');
     } else {
-      notify('Multi-Number Mode: All numbers in the row (Mother, Father, etc.) will be exported.', 'info');
+      notify('Multi-Number Mode: All numbers in row (Mother, Father, etc.) will be captured.', 'info');
     }
+  };
+
+  const handleDuplicateBasisChange = (newBasis) => {
+    setDuplicateBasis(newBasis);
+    processRows(rawRows, selectedNameCol, selectedPhoneCol, removeDuplicates, numberMode, newBasis);
+    const labels = {
+      phone: 'Phone Number Only',
+      both: 'Both Same Name & Phone',
+      name: 'Name Only'
+    };
+    notify(`Duplicate detection now checking: ${labels[newBasis]}`, 'info');
   };
 
   // Stats calculation
@@ -250,14 +313,12 @@ export default function ExcelCleaner({ notify, onRefreshDb }) {
       return;
     }
 
-    // Format strictly as Name and Phone No (10 digits)
     const exportData = validNumbersList.map((item) => ({
-      Name: item.name,        // Pure Clean Name (No suffixes)
-      'Phone No': item.phone, // Strictly 10 digits
+      Name: item.name,
+      'Phone No': item.phone,
     }));
 
     const worksheet = XLSX.utils.json_to_sheet(exportData);
-
     worksheet['!cols'] = [
       { wch: 26 }, // Name
       { wch: 18 }, // Phone No
@@ -294,9 +355,9 @@ export default function ExcelCleaner({ notify, onRefreshDb }) {
             createLead({
               name: item.name,
               phone: item.phone,
-              source: `Excel: ${fileName || 'Uploaded Sheet'}`,
+              source: `Excel: ${fileName || 'Uploaded Sheet'} (Row ${item.rowNumber})`,
               status: 'New',
-              notes: `Auto-cleaned 10-digit number. Found in column: ${item.foundInColumn}`,
+              notes: `Auto-cleaned 10-digit number. Excel Row #${item.rowNumber}`,
             })
           )
         );
@@ -315,26 +376,45 @@ export default function ExcelCleaner({ notify, onRefreshDb }) {
     }
   };
 
-  // Generate Sample Messy Excel with Shuffled Columns and clean names
+  // Generate Sample Messy Excel with Shuffled Columns & Duplicates
   const handleGenerateSampleExcel = () => {
     const sampleMessyData = [
+      // Row 2 in Excel: First occurrence of Aarav Sharma (Phone: 9876543210)
       { 'Name CUTOURE': 'Aarav Sharma', City: 'Mumbai', 'Mother Contact': '+91 98765 43210', 'Father Contact': '9812345678' },
+      
+      // Row 3 in Excel: Priya Patel
       { 'Field A': '09811223344', City: 'Bengaluru', Age: 31, 'Contact Person': 'Priya Patel' },
+      
+      // Row 4 in Excel: Rahul Verma
       { Code: 'C103', 'Customer Name': 'Rahul Verma', Status: 'Active', City: 'Delhi', 'Phone No': '919822334455' },
+      
+      // Row 5 in Excel: Sneha Rao
       { 'Client Name': 'Sneha Rao', 'Primary Mobile': '98765-43210', City: 'Hyderabad' },
+      
+      // Row 6 in Excel: Vikram Mehta
       { ID: 105, Dept: 'Sales', 'Full Name': 'Vikram Mehta', 'Contact': '+91-9988776655', City: 'Pune' },
-      { 'Name CUTOURE': 'Aarav Sharma', City: 'Mumbai', 'Mother Contact': '9876543210' }, // Duplicate check
+      
+      // Row 7 in Excel: DUPLICATE OF ROW 2! (Same Phone: 9876543210)
+      { 'Name CUTOURE': 'Aarav Sharma', City: 'Mumbai', 'Mother Contact': '9876543210' },
+      
+      // Row 8 in Excel: Ananya Deshmukh
       { 'Buyer': 'Ananya Deshmukh', City: 'Nagpur', 'Mobile': '9765432190' },
-      { 'Contact': 'Short Number User', 'Phone': '987654' }, // Invalid (<10 digits)
+      
+      // Row 9 in Excel: Invalid (<10 digits)
+      { 'Contact': 'Short Number User', 'Phone': '987654' },
+      
+      // Row 10 in Excel: DUPLICATE OF ROW 3! (Same Phone: 9811223344)
+      { 'Contact Person': 'Priya Patel (Repeat Entry)', City: 'Bengaluru', 'Phone': '9811223344' },
+      
+      // Row 11 in Excel: Karan Singhania
       { 'Customer': 'Karan Singhania', 'Contact No': 9833411223 },
-      { 'Customer': 'Blank Number User', 'Contact No': '' },
     ];
 
     const worksheet = XLSX.utils.json_to_sheet(sampleMessyData);
     const workbook = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(workbook, worksheet, 'Messy Sample');
-    XLSX.writeFile(workbook, 'Sample_Messy_Shuffled_Excel.xlsx');
-    notify('Downloaded Sample Excel with Mother & Father contact columns for testing!', 'info');
+    XLSX.utils.book_append_sheet(workbook, worksheet, 'Sample with Duplicates');
+    XLSX.writeFile(workbook, 'Sample_Excel_With_Duplicates.xlsx');
+    notify('Downloaded Sample Excel! Row 7 is duplicate of Row 2, Row 10 is duplicate of Row 3.', 'info');
   };
 
   return (
@@ -348,7 +428,7 @@ export default function ExcelCleaner({ notify, onRefreshDb }) {
               <span>Smart Excel Filter & 10-Digit Phone Cleaner</span>
             </h1>
             <p className="page-description">
-              Upload any messy Excel sheet. Output Excel me hamesha strictly <strong>Name</strong> aur <strong>Phone No</strong> (10 digits) aayega.
+              Upload any Excel sheet. Duplicate detection accurately tracks <strong>which Excel row number matched with which earlier row</strong>.
             </p>
           </div>
 
@@ -356,10 +436,10 @@ export default function ExcelCleaner({ notify, onRefreshDb }) {
             type="button" 
             className="btn btn-secondary btn-sm"
             onClick={handleGenerateSampleExcel}
-            title="Download test Excel with Mother and Father contacts"
+            title="Download test Excel with duplicate rows in Row 2, Row 7, Row 10"
           >
             <Download size={14} />
-            <span>Download Sample Excel</span>
+            <span>Download Sample with Duplicates</span>
           </button>
         </div>
       </div>
@@ -390,82 +470,142 @@ export default function ExcelCleaner({ notify, onRefreshDb }) {
           </div>
         </div>
 
-        {/* PROMINENT Number Mode Selection (1 Number vs All Numbers) */}
+        {/* Configuration Bar */}
         {availableColumns.length > 0 && (
-          <div style={{ background: '#f8fafc', border: '1px solid var(--border)', borderRadius: 'var(--radius-md)', padding: '1rem', display: 'flex', flexDirection: 'column', gap: '0.85rem' }}>
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '0.5rem' }}>
-              <div style={{ fontSize: '0.86rem', fontWeight: 700, color: 'var(--text-main)', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+          <div style={{ background: '#f8fafc', border: '1px solid var(--border)', borderRadius: 'var(--radius-md)', padding: '1rem', display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+            
+            {/* 1 Number vs All Numbers */}
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+              <div style={{ fontSize: '0.84rem', fontWeight: 700, color: 'var(--text-main)', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
                 <PhoneCall size={16} style={{ color: '#4f46e5' }} />
-                <span>Agar Ek Row Me 2 Number Ho (Jaise Mother & Father Contact) Toh Kya Karein?</span>
+                <span>Ek Row Me Multiple Numbers (Mother / Father Contact) Hone Par:</span>
               </div>
-            </div>
 
-            {/* Clear Radio Buttons */}
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', gap: '0.75rem' }}>
-              <div 
-                onClick={() => handleNumberModeChange('single')}
-                style={{
-                  padding: '0.75rem 1rem',
-                  borderRadius: 'var(--radius-md)',
-                  border: `2px solid ${numberMode === 'single' ? '#4f46e5' : 'var(--border)'}`,
-                  background: numberMode === 'single' ? '#eef2ff' : '#ffffff',
-                  cursor: 'pointer',
-                  display: 'flex',
-                  alignItems: 'flex-start',
-                  gap: '0.65rem',
-                  transition: 'all 0.15s ease'
-                }}
-              >
-                <input
-                  type="radio"
-                  name="numberMode"
-                  checked={numberMode === 'single'}
-                  onChange={() => handleNumberModeChange('single')}
-                  style={{ marginTop: '0.2rem', cursor: 'pointer', transform: 'scale(1.15)' }}
-                />
-                <div>
-                  <div style={{ fontWeight: 700, fontSize: '0.86rem', color: numberMode === 'single' ? '#4f46e5' : 'var(--text-main)' }}>
-                    ✅ 1 Number Per Row (Recommended)
-                  </div>
-                  <div style={{ fontSize: '0.76rem', color: 'var(--text-secondary)', marginTop: '0.15rem' }}>
-                    Ek person ka sirf 1 primary number aayega. Row kabhi duplicate nahi hogi.
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', gap: '0.75rem' }}>
+                <div 
+                  onClick={() => handleNumberModeChange('single')}
+                  style={{
+                    padding: '0.75rem 1rem',
+                    borderRadius: 'var(--radius-md)',
+                    border: `2px solid ${numberMode === 'single' ? '#4f46e5' : 'var(--border)'}`,
+                    background: numberMode === 'single' ? '#eef2ff' : '#ffffff',
+                    cursor: 'pointer',
+                    display: 'flex',
+                    alignItems: 'flex-start',
+                    gap: '0.65rem'
+                  }}
+                >
+                  <input
+                    type="radio"
+                    name="numberMode"
+                    checked={numberMode === 'single'}
+                    onChange={() => handleNumberModeChange('single')}
+                    style={{ marginTop: '0.2rem', cursor: 'pointer', transform: 'scale(1.15)' }}
+                  />
+                  <div>
+                    <div style={{ fontWeight: 700, fontSize: '0.85rem', color: numberMode === 'single' ? '#4f46e5' : 'var(--text-main)' }}>
+                      ✅ 1 Number Per Row (Recommended)
+                    </div>
+                    <div style={{ fontSize: '0.75rem', color: 'var(--text-secondary)' }}>
+                      Ek row se sirf 1 primary number aayega. Row kabhi duplicate nahi hogi.
+                    </div>
                   </div>
                 </div>
-              </div>
 
-              <div 
-                onClick={() => handleNumberModeChange('all')}
-                style={{
-                  padding: '0.75rem 1rem',
-                  borderRadius: 'var(--radius-md)',
-                  border: `2px solid ${numberMode === 'all' ? '#4f46e5' : 'var(--border)'}`,
-                  background: numberMode === 'all' ? '#eef2ff' : '#ffffff',
-                  cursor: 'pointer',
-                  display: 'flex',
-                  alignItems: 'flex-start',
-                  gap: '0.65rem',
-                  transition: 'all 0.15s ease'
-                }}
-              >
-                <input
-                  type="radio"
-                  name="numberMode"
-                  checked={numberMode === 'all'}
-                  onChange={() => handleNumberModeChange('all')}
-                  style={{ marginTop: '0.2rem', cursor: 'pointer', transform: 'scale(1.15)' }}
-                />
-                <div>
-                  <div style={{ fontWeight: 700, fontSize: '0.86rem', color: numberMode === 'all' ? '#4f46e5' : 'var(--text-main)' }}>
-                    📋 Extract Both Numbers
-                  </div>
-                  <div style={{ fontSize: '0.76rem', color: 'var(--text-secondary)', marginTop: '0.15rem' }}>
-                    Agar Mother aur Father dono ka number alag hai, toh dono capture honge.
+                <div 
+                  onClick={() => handleNumberModeChange('all')}
+                  style={{
+                    padding: '0.75rem 1rem',
+                    borderRadius: 'var(--radius-md)',
+                    border: `2px solid ${numberMode === 'all' ? '#4f46e5' : 'var(--border)'}`,
+                    background: numberMode === 'all' ? '#eef2ff' : '#ffffff',
+                    cursor: 'pointer',
+                    display: 'flex',
+                    alignItems: 'flex-start',
+                    gap: '0.65rem'
+                  }}
+                >
+                  <input
+                    type="radio"
+                    name="numberMode"
+                    checked={numberMode === 'all'}
+                    onChange={() => handleNumberModeChange('all')}
+                    style={{ marginTop: '0.2rem', cursor: 'pointer', transform: 'scale(1.15)' }}
+                  />
+                  <div>
+                    <div style={{ fontWeight: 700, fontSize: '0.85rem', color: numberMode === 'all' ? '#4f46e5' : 'var(--text-main)' }}>
+                      📋 Extract Both Numbers
+                    </div>
+                    <div style={{ fontSize: '0.75rem', color: 'var(--text-secondary)' }}>
+                      Mother aur Father dono ka number alag-alag capture hoga.
+                    </div>
                   </div>
                 </div>
               </div>
             </div>
 
-            {/* Column Target Selectors */}
+            {/* DUPLICATE DETECTION BASIS SELECTOR */}
+            <div style={{ borderTop: '1px solid var(--border)', paddingTop: '0.85rem', display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '0.5rem' }}>
+                <div style={{ fontSize: '0.84rem', fontWeight: 700, color: 'var(--text-main)', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                  <CopyCheck size={16} style={{ color: '#d97706' }} />
+                  <span>Duplicate Check Kis Base Par Karein?</span>
+                </div>
+
+                <label style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.82rem', fontWeight: 600, color: 'var(--text-secondary)', cursor: 'pointer' }}>
+                  <input
+                    type="checkbox"
+                    checked={removeDuplicates}
+                    onChange={handleDeduplicateToggle}
+                    style={{ cursor: 'pointer', transform: 'scale(1.1)' }}
+                  />
+                  <span>Exclude Duplicates from Download</span>
+                </label>
+              </div>
+
+              <div style={{ display: 'flex', alignItems: 'center', gap: '1rem', flexWrap: 'wrap' }}>
+                <label style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.82rem', cursor: 'pointer' }}>
+                  <input
+                    type="radio"
+                    name="duplicateBasis"
+                    value="phone"
+                    checked={duplicateBasis === 'phone'}
+                    onChange={() => handleDuplicateBasisChange('phone')}
+                  />
+                  <span style={{ fontWeight: duplicateBasis === 'phone' ? 700 : 500 }}>
+                    📱 Phone Number Base (Recommended - Same phone = Duplicate)
+                  </span>
+                </label>
+
+                <label style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.82rem', cursor: 'pointer' }}>
+                  <input
+                    type="radio"
+                    name="duplicateBasis"
+                    value="both"
+                    checked={duplicateBasis === 'both'}
+                    onChange={() => handleDuplicateBasisChange('both')}
+                  />
+                  <span style={{ fontWeight: duplicateBasis === 'both' ? 700 : 500 }}>
+                    👤+📱 Both Same Name AND Phone
+                  </span>
+                </label>
+
+                <label style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.82rem', cursor: 'pointer' }}>
+                  <input
+                    type="radio"
+                    name="duplicateBasis"
+                    value="name"
+                    checked={duplicateBasis === 'name'}
+                    onChange={() => handleDuplicateBasisChange('name')}
+                  />
+                  <span style={{ fontWeight: duplicateBasis === 'name' ? 700 : 500 }}>
+                    👤 Name Base Only
+                  </span>
+                </label>
+              </div>
+            </div>
+
+            {/* Target Column Mapping */}
             <div className="mapping-selectors" style={{ borderTop: '1px solid var(--border)', paddingTop: '0.75rem' }}>
               <div className="selector-group">
                 <label className="selector-label">Target Name Column:</label>
@@ -494,18 +634,6 @@ export default function ExcelCleaner({ notify, onRefreshDb }) {
                   ))}
                 </select>
               </div>
-
-              <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginLeft: 'auto' }}>
-                <label style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.82rem', fontWeight: 600, color: 'var(--text-secondary)', cursor: 'pointer' }}>
-                  <input
-                    type="checkbox"
-                    checked={removeDuplicates}
-                    onChange={handleDeduplicateToggle}
-                    style={{ cursor: 'pointer', transform: 'scale(1.1)' }}
-                  />
-                  <span>Remove Duplicates</span>
-                </label>
-              </div>
             </div>
           </div>
         )}
@@ -517,6 +645,7 @@ export default function ExcelCleaner({ notify, onRefreshDb }) {
           <div 
             className={`metric-pill ${filterMode === 'all' ? 'active' : ''}`}
             onClick={() => setFilterMode('all')}
+            title="Show all rows from Excel"
           >
             <span className="metric-num">{totalRowsCount}</span>
             <span className="metric-text">Total Input Rows</span>
@@ -525,25 +654,38 @@ export default function ExcelCleaner({ notify, onRefreshDb }) {
           <div 
             className={`metric-pill success ${filterMode === 'valid' ? 'active' : ''}`}
             onClick={() => setFilterMode('valid')}
+            title="Show only valid clean 10-digit leads (ready for download)"
           >
             <span className="metric-num">{validCount}</span>
-            <span className="metric-text">✅ Clean 10-Digit Numbers</span>
+            <span className="metric-text">✅ Clean 10-Digit (Ready)</span>
           </div>
 
           <div 
             className={`metric-pill warning ${filterMode === 'duplicates' ? 'active' : ''}`}
             onClick={() => setFilterMode('duplicates')}
+            title="Click to inspect all duplicate rows and which rows they matched with!"
           >
             <span className="metric-num">{duplicateCount}</span>
-            <span className="metric-text">⚠️ Duplicates</span>
+            <span className="metric-text">⚠️ Duplicates (Click to View)</span>
           </div>
 
           <div 
             className={`metric-pill danger ${filterMode === 'invalid' ? 'active' : ''}`}
             onClick={() => setFilterMode('invalid')}
+            title="Show invalid or missing numbers"
           >
             <span className="metric-num">{invalidCount}</span>
-            <span className="metric-text">❌ Invalid / No Number</span>
+            <span className="metric-text">❌ Invalid (&lt;10 Digits / Blank)</span>
+          </div>
+        </div>
+      )}
+
+      {/* Info Banner when viewing Duplicates */}
+      {processedData.length > 0 && filterMode === 'duplicates' && (
+        <div style={{ background: '#fffbeb', border: '1px solid #fde68a', borderRadius: 'var(--radius-md)', padding: '0.85rem 1.15rem', display: 'flex', alignItems: 'center', gap: '0.65rem', color: '#92400e', fontSize: '0.84rem' }}>
+          <Info size={18} style={{ color: '#d97706', flexShrink: 0 }} />
+          <div>
+            <strong>Duplicates Inspector Active:</strong> Neeche di gayi table me saaf-saaf dikhega ki <strong>kaun sa row number</strong> pehle kis <strong>row number</strong> me aa chuka tha (Basis: {duplicateBasis === 'phone' ? 'Phone Number' : duplicateBasis === 'both' ? 'Name & Phone' : 'Name'}).
           </div>
         </div>
       )}
@@ -591,36 +733,70 @@ export default function ExcelCleaner({ notify, onRefreshDb }) {
             <table className="clean-table">
               <thead>
                 <tr>
-                  <th style={{ width: '50px' }}>#</th>
+                  <th style={{ width: '85px' }}>Excel Row #</th>
                   <th>Output: Name</th>
                   <th>Output: Phone No (10-Digit)</th>
                   <th>Found In Column</th>
-                  <th>Original Value</th>
+                  <th>Duplicate Match Details</th>
                   <th>Validation Status</th>
                 </tr>
               </thead>
               <tbody>
-                {displayRows.slice(0, 100).map((row, idx) => (
-                  <tr key={row.id}>
-                    <td style={{ color: 'var(--text-muted)', fontSize: '0.8rem' }}>{idx + 1}</td>
+                {displayRows.slice(0, 100).map((row) => (
+                  <tr key={row.id} style={{ background: row.isDuplicate ? '#fffdf5' : 'inherit' }}>
+                    {/* Excel Row Number */}
+                    <td>
+                      <span style={{ fontWeight: 700, fontSize: '0.8rem', background: '#f1f5f9', padding: '0.2rem 0.5rem', borderRadius: '4px', color: 'var(--text-secondary)' }}>
+                        Row #{row.rowNumber}
+                      </span>
+                    </td>
+
+                    {/* Clean Name */}
                     <td>
                       <div style={{ fontWeight: 600, color: 'var(--text-main)' }}>{row.name}</div>
                     </td>
+
+                    {/* Clean Phone */}
                     <td>
                       <div style={{ fontFamily: 'monospace', fontWeight: 700, fontSize: '0.92rem', color: row.isValid ? '#059669' : '#dc2626' }}>
                         {row.phone || '—'}
                       </div>
                     </td>
+
+                    {/* Column Source */}
                     <td>
                       <span style={{ fontSize: '0.74rem', background: '#f1f5f9', padding: '0.15rem 0.5rem', borderRadius: '4px', color: 'var(--text-secondary)' }}>
                         {row.foundInColumn}
                       </span>
                     </td>
+
+                    {/* EXACT MATCH DETAILS (Shows which row number it duplicated!) */}
                     <td>
-                      <div style={{ fontSize: '0.78rem', color: 'var(--text-secondary)' }}>
-                        {row.originalPhone}
-                      </div>
+                      {row.isDuplicate && (
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
+                          <span style={{ fontSize: '0.76rem', fontWeight: 700, color: '#b45309' }}>
+                            ⚠️ Duplicate of Excel Row #{row.duplicateOfRow}
+                          </span>
+                          <span style={{ fontSize: '0.72rem', color: 'var(--text-secondary)' }}>
+                            First seen on Row #{row.duplicateOfRow} ({row.duplicateOfName})
+                          </span>
+                        </div>
+                      )}
+
+                      {!row.isDuplicate && row.repeatedInRows && row.repeatedInRows.length > 0 && (
+                        <div style={{ fontSize: '0.74rem', color: '#0369a1' }}>
+                          <strong>⭐ First Occurrence:</strong> Also repeated in Row {row.repeatedInRows.map((r) => `#${r}`).join(', ')}
+                        </div>
+                      )}
+
+                      {!row.isDuplicate && (!row.repeatedInRows || row.repeatedInRows.length === 0) && (
+                        <span style={{ fontSize: '0.74rem', color: 'var(--text-muted)' }}>
+                          Unique (No duplicate found)
+                        </span>
+                      )}
                     </td>
+
+                    {/* Validation Status */}
                     <td>
                       {row.isValid && !row.isDuplicate && (
                         <span className="badge-light badge-success">
@@ -629,7 +805,7 @@ export default function ExcelCleaner({ notify, onRefreshDb }) {
                       )}
                       {row.isValid && row.isDuplicate && (
                         <span className="badge-light badge-warning">
-                          <AlertTriangle size={12} /> Duplicate Number
+                          <AlertTriangle size={12} /> Duplicate
                         </span>
                       )}
                       {!row.isValid && (
