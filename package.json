@@ -3,6 +3,8 @@
   "version": "1.0.0",
   "description": "DataFlow CRM - React, Node.js, Express & MongoDB with Excel Import/Filter/Export",
   "scripts": {
+    "start": "node server/server.js",
+    "build": "npm run build --prefix client",
     "server": "npm run start --prefix server",
     "server:dev": "npm run dev --prefix server",
     "client": "npm run dev --prefix client",

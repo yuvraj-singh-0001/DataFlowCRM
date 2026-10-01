@@ -11,6 +11,8 @@ try {
 const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
+const path = require('path');
+const fs = require('fs');
 const crmRoutes = require('./routes/crmRoutes');
 const Lead = require('./models/Lead');
 
@@ -61,6 +63,30 @@ app.get('/api/health', (req, res) => {
 
 // Mount CRM API routes
 app.use('/api/leads', crmRoutes);
+
+// Frontend static build serving (Production & Live Hosting)
+const clientDistPath = path.resolve(__dirname, '../client/dist');
+if (fs.existsSync(clientDistPath)) {
+  console.log(`[*] Client build detected at: ${clientDistPath}`);
+  app.use(express.static(clientDistPath));
+
+  // SPA fallback: any non-API GET request serves index.html
+  app.get('*', (req, res, next) => {
+    if (req.path.startsWith('/api')) {
+      return res.status(404).json({ success: false, message: 'API endpoint not found' });
+    }
+    res.sendFile(path.join(clientDistPath, 'index.html'));
+  });
+} else {
+  // If dist is not yet built (pure local API dev server mode)
+  app.get('/', (req, res) => {
+    res.json({
+      message: 'DataFlow CRM Backend API is running.',
+      healthCheck: '/api/health',
+      leadsApi: '/api/leads',
+    });
+  });
+}
 
 // Error Handling Middleware
 app.use((err, req, res, next) => {

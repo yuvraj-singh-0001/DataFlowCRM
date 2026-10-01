@@ -1,4 +1,6 @@
-const API_BASE = 'http://localhost:5000/api';
+// Use relative '/api' path by default (works locally via Vite proxy and in production)
+// Can be overridden with VITE_API_URL if frontend and backend are hosted on separate domains
+export const API_BASE = import.meta.env.VITE_API_URL || '/api';
 
 export async function fetchHealth() {
   const res = await fetch(`${API_BASE}/health`);
